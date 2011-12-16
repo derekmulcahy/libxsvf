@@ -35,59 +35,72 @@
 int idVendor  = DEFAULT_VENDOR_ID;
 int idProduct = DEFAULT_PRODUCT_ID;
 
-struct udata_s {
+struct udata_s
+{
 	FILE *f;
 	int verbose;
 	int retval_i;
 	int retval[256];
 	usb_dev_handle *usbdev;
+
+	uint8_t cmdidx;
+	uint8_t cmdbuf[64];
+	uint8_t retbuf_expect_set[16];
+	uint8_t retbuf_expect_clr[16];
+	uint8_t retbuf_toretval[16];
+	int error, last_tdo;
 };
 
 int usb_send_chunk(usb_dev_handle *dh, int ep, const void *data, int len)
 {
-        int ret;
+	int ret;
 #if 0
-        if (ep == 2) {
-                int i;
-                fprintf(stderr, "<ep2:%4d bytes> ...", len);
-                for (i = len-16; i < len; i++) {
-                        if (i < 0)
-                                continue;
-                        fprintf(stderr, " %02x", ((unsigned char*)data)[i]);
-                }
-                fprintf(stderr, "\n");
-        }
+	int i;
+	fprintf(stderr, "<ep%d:%4d bytes out>", ep, len);
+	for (i = 0; i < len; i++)
+		fprintf(stderr, " %02x", ((unsigned char *)data)[i]);
+	fprintf(stderr, "\n");
 #endif
 retry_write:
-        ret = usb_bulk_write(dh, ep, data, len, 1000);
-        if (ret == -ETIMEDOUT) {
-                fprintf(stderr, "usb_recv_chunk: usb write timeout -> retry\n");
-                goto retry_write;
-        }
-        if (ret != len)
-                fprintf(stderr, "usb_send_chunk: write of %d bytes to ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
-        return ret == len ? 0 : -1;
+	ret = usb_bulk_write(dh, ep, data, len, 1000);
+	if (ret == -ETIMEDOUT) {
+		fprintf(stderr, "usb_recv_chunk: usb write timeout -> retry\n");
+		goto retry_write;
+	}
+	if (ret != len)
+		fprintf(stderr, "usb_send_chunk: write of %d bytes to ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
+	return ret == len ? 0 : -1;
 }
 
 int usb_recv_chunk(usb_dev_handle *dh, int ep, void *data, int len, int *ret_len)
 {
-        int ret;
+	int ret;
 retry_read:
-        ret = usb_bulk_read(dh, ep, data, len, 1000);
-        if (ret == -ETIMEDOUT) {
-                fprintf(stderr, "usb_recv_chunk: usb read timeout -> retry\n");
-                goto retry_read;
-        }
-        if (ret > 0 && ret_len != NULL)
-                len = *ret_len = ret;
-        if (ret != len)
-                fprintf(stderr, "usb_recv_chunk: read of %d bytes from ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
-        return ret == len ? 0 : -1;
+	ret = usb_bulk_read(dh, ep, data, len, 1000);
+	if (ret == -ETIMEDOUT) {
+		fprintf(stderr, "usb_recv_chunk: usb read timeout -> retry\n");
+		goto retry_read;
+	}
+	if (ret > 0 && ret_len != NULL)
+		len = *ret_len = ret;
+	if (ret != len)
+		fprintf(stderr, "usb_recv_chunk: read of %d bytes from ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
+#if 0
+	int i;
+	fprintf(stderr, "<ep%d:%4d bytes in>", ep, len);
+	for (i = 0; i < len; i++)
+		fprintf(stderr, " %02x", ((unsigned char *)data)[i]);
+	fprintf(stderr, "\n");
+#endif
+	return ret == len ? 0 : -1;
 }
 
 static int h_setup(struct libxsvf_host *h)
 {
 	struct udata_s *u = h->user_data;
+
+	u->cmdidx = 0;
+	u->error = 0;
 
 	if (u->verbose >= 2) {
 		fprintf(stderr, "[SETUP]\n");
@@ -163,33 +176,84 @@ static int h_getbyte(struct libxsvf_host *h)
 	return fgetc(u->f);
 }
 
-static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rmask, int sync UNUSED)
+static void xfer(struct udata_s *u)
+{
+	uint8_t response[16];
+	uint8_t i, j;
+
+	while (u->cmdidx % 8 != 0) {
+		uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
+		if (u->cmdidx % 2 == 0)
+			u->cmdbuf[cmdoff] |= 0x40;
+		else
+			u->cmdbuf[cmdoff] |= 0x04;
+	}
+
+	u->cmdbuf[1] = u->cmdidx / 8;
+	usb_send_chunk(u->usbdev, 2, u->cmdbuf, u->cmdbuf[1]*4 + 2);
+	usb_recv_chunk(u->usbdev, 2, response, u->cmdbuf[1], NULL);
+
+	for (i = 0; i < u->cmdbuf[1]; i++)
+	{
+		if ((response[i] & u->retbuf_expect_set[i]) != u->retbuf_expect_set[i])
+			u->error = 1;
+		if ((~response[i] & u->retbuf_expect_clr[i]) != u->retbuf_expect_clr[i])
+			u->error = 1;
+		for (j = 0; u->retbuf_toretval[i] && j < 8; j++)
+			if ((u->retbuf_toretval[i] & (1 << j)) != 0)
+				u->retval[u->retval_i++] = (response[i] & (1 << j)) != 0;
+		u->last_tdo = (response[i] & 0x80) != 0;
+	}
+
+	u->cmdidx = 0;
+}
+
+static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rmask, int sync)
 {
 	struct udata_s *u = h->user_data;
 	int rc = 0;
 
-	uint8_t command[6] = { 0x06, 0x01, 0x40, 0x44, 0x44, 0x44 };
-	uint8_t response[1];
+	if (u->cmdidx == 0) {
+		memset(u->cmdbuf, 0, 64);
+		memset(u->retbuf_expect_set, 0, 16);
+		memset(u->retbuf_expect_clr, 0, 16);
+		memset(u->retbuf_toretval, 0, 16);
+		u->cmdbuf[0] = 0x06;
+	}
 
-	command[2] |= tdi ? 0x01 : 0x00;
-	command[2] |= tms ? 0x02 : 0x00;
+	uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
 
-	rc |= usb_send_chunk(u->usbdev, 2, command, 6);
-	rc |= usb_recv_chunk(u->usbdev, 2, response, 1, NULL);
+	if (u->cmdidx % 2 == 0) {
+		u->cmdbuf[cmdoff] |= tdi ? 0x10 : 0x00;
+		u->cmdbuf[cmdoff] |= tms ? 0x20 : 0x00;
+	} else {
+		u->cmdbuf[cmdoff] |= tdi ? 0x01 : 0x00;
+		u->cmdbuf[cmdoff] |= tms ? 0x02 : 0x00;
+	}
 
-	uint8_t line_tdo = (response[0] & 0x01) != 0;
+	if (tdo == 1)
+		u->retbuf_expect_set[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
+	if (tdo == 0)
+		u->retbuf_expect_clr[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
+	if (rmask)
+		u->retbuf_toretval[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
 
-	if (rc >= 0)
-		rc = line_tdo;
+	if (cmdoff > 60 || sync)
+		xfer(u);
+	else
+		u->last_tdo = -1;
 
-	if (rmask == 1 && u->retval_i < 256)
-		u->retval[u->retval_i++] = line_tdo;
-
-	if (tdo >= 0 && tdo != line_tdo)
-		rc = -1;
+	rc = tdo < 0 ? 1 : tdo;
+	if (sync) {
+		if (u->error) {
+			u->error = 0;
+			rc = -1;
+		} else
+			rc = u->last_tdo;
+	}
 
 	if (u->verbose >= 4) {
-		fprintf(stderr, "[TMS:%d, TDI:%d, TDO_ARG:%d, TDO_LINE:%d, RMASK:%d, RC:%d]\n", tms, tdi, tdo, line_tdo, rmask, rc);
+		fprintf(stderr, "[TMS:%d, TDI:%d, TDO_ARG:%d, TDO_LINE:%d, RMASK:%d, RC:%d]\n", tms, tdi, tdo, u->last_tdo, rmask, rc);
 	}
 
 	return rc;
