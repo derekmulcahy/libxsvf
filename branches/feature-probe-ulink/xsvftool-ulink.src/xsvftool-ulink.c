@@ -19,19 +19,16 @@
 
 #include "libxsvf.h"
 
-#include "ezusb8051.h"
-#include "jtag.h"
-#include "jtag_def.h"
-
 #include <sys/time.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <usb.h>
 
-#define DEFAULT_VENDOR_ID 0x0547
-#define DEFAULT_PRODUCT_ID 0xCFAA
+#define DEFAULT_VENDOR_ID 0xC251
+#define DEFAULT_PRODUCT_ID 0x2710
 
 #define UNUSED __attribute__((unused))
 
@@ -43,20 +40,77 @@ struct udata_s {
 	int verbose;
 	int retval_i;
 	int retval[256];
+	usb_dev_handle *usbdev;
 };
+
+int usb_send_chunk(usb_dev_handle *dh, int ep, const void *data, int len)
+{
+        int ret;
+#if 0
+        if (ep == 2) {
+                int i;
+                fprintf(stderr, "<ep2:%4d bytes> ...", len);
+                for (i = len-16; i < len; i++) {
+                        if (i < 0)
+                                continue;
+                        fprintf(stderr, " %02x", ((unsigned char*)data)[i]);
+                }
+                fprintf(stderr, "\n");
+        }
+#endif
+retry_write:
+        ret = usb_bulk_write(dh, ep, data, len, 1000);
+        if (ret == -ETIMEDOUT) {
+                fprintf(stderr, "usb_recv_chunk: usb write timeout -> retry\n");
+                goto retry_write;
+        }
+        if (ret != len)
+                fprintf(stderr, "usb_send_chunk: write of %d bytes to ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
+        return ret == len ? 0 : -1;
+}
+
+int usb_recv_chunk(usb_dev_handle *dh, int ep, void *data, int len, int *ret_len)
+{
+        int ret;
+retry_read:
+        ret = usb_bulk_read(dh, ep, data, len, 1000);
+        if (ret == -ETIMEDOUT) {
+                fprintf(stderr, "usb_recv_chunk: usb read timeout -> retry\n");
+                goto retry_read;
+        }
+        if (ret > 0 && ret_len != NULL)
+                len = *ret_len = ret;
+        if (ret != len)
+                fprintf(stderr, "usb_recv_chunk: read of %d bytes from ep %d returned %d: %s\n", len, ep, ret, ret >= 0 ? "NO ERROR" : usb_strerror());
+        return ret == len ? 0 : -1;
+}
 
 static int h_setup(struct libxsvf_host *h)
 {
 	struct udata_s *u = h->user_data;
+
 	if (u->verbose >= 2) {
 		fprintf(stderr, "[SETUP]\n");
 		fflush(stderr);
 	}
-	if (ezusbOpen(idVendor, idProduct) < 0) {
-		fprintf(stderr, "Couldn't open a ezusb8051 device with VID = 0x%04X and PID = 0x%04X.\n", idVendor, idProduct);
-		return -1;
+
+	struct usb_bus *b;
+	struct usb_device *d;
+	for (b = usb_get_busses(); b; b = b->next) {
+		for (d = b->devices; d; d = d->next) {
+			if ((d->descriptor.idVendor == idVendor) && (d->descriptor.idProduct == idProduct)) {
+				u->usbdev = usb_open(d);
+				if (usb_claim_interface(u->usbdev, 0) < 0) {
+					usb_close(u->usbdev);
+					continue;
+				}
+				return 0;
+			}
+		}
 	}
-	return 0;
+
+	fprintf(stderr, "Couldn't open ULINK device with VID = 0x%04X and PID = 0x%04X.\n", idVendor, idProduct);
+	return -1;
 }
 
 static int h_shutdown(struct libxsvf_host *h)
@@ -66,7 +120,8 @@ static int h_shutdown(struct libxsvf_host *h)
 		fprintf(stderr, "[SHUTDOWN]\n");
 		fflush(stderr);
 	}
-	ezusbClose();
+	usb_release_interface(u->usbdev, 0);
+	usb_close(u->usbdev);
 	return 0;
 }
 
@@ -113,29 +168,18 @@ static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rm
 	struct udata_s *u = h->user_data;
 	int rc = 0;
 
-	if (jtag_simple_command(tms ? JTAG_SET_TMS : JTAG_CLEAR_TMS)) {
-		fprintf(stderr, "Failed setting TMS.\n");
-		rc = -1;
-	}
+	uint8_t command[6] = { 0x06, 0x01, 0x40, 0x44, 0x44, 0x44 };
+	uint8_t response[1];
 
-	if (tdi >= 0)
-		if (jtag_simple_command(tdi ? JTAG_SET_TDI : JTAG_CLEAR_TDI)) {
-			fprintf(stderr, "Failed setting TDI.\n");
-			rc = -1;
-		}
+	command[2] |= tdi ? 0x01 : 0x00;
+	command[2] |= tms ? 0x02 : 0x00;
 
-	if (jtag_simple_command(JTAG_TOGGLE)) {
-		fprintf(stderr, "Pulsing TCK failed.\n");
-		rc = -1;
-	}
+	rc |= usb_send_chunk(u->usbdev, 2, command, 6);
+	rc |= usb_recv_chunk(u->usbdev, 2, response, 1, NULL);
 
-	uint8_t line_tdo = -1;
-	if (jtag_read_TDO(&line_tdo) || line_tdo > 1) {
-		fprintf(stderr, "Failed reading TDO.\n");
-		rc = -1;
-	}
+	uint8_t line_tdo = (response[0] & 0x01) != 0;
 
-	if (line_tdo < 2 && rc >= 0)
+	if (rc >= 0)
 		rc = line_tdo;
 
 	if (rmask == 1 && u->retval_i < 256)
@@ -275,6 +319,10 @@ int main(int argc, char **argv)
 	int gotaction = 0;
 	int hex_mode = 0;
 	int opt, i, j;
+
+	usb_init();
+	usb_find_busses();
+	usb_find_devices();
 
 	progname = argc >= 1 ? argv[0] : "xvsftool";
 	while ((opt = getopt(argc, argv, "vLBx:s:c")) != -1)

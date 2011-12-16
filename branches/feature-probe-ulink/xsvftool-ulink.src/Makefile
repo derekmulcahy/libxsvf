@@ -17,12 +17,11 @@
 #
 
 LIBXSVFDIR = ..
-HOSTLIBDIR = /mnt/data/home-clifford/Work/Bacc-2009WS-Glaser-JTAG/host/lib
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -Os -ggdb -I$(LIBXSVFDIR) -I$(HOSTLIBDIR) -MD
-LDFLAGS = -L$(LIBXSVFDIR) -L$(HOSTLIBDIR)
-LDLIBS = -lusb -lreadline -lxsvf -lezusb
+CFLAGS = -Wall -Wextra -Werror -Os -ggdb -I$(LIBXSVFDIR) -MD
+LDFLAGS = -L$(LIBXSVFDIR)
+LDLIBS = -lusb -lreadline -lxsvf
 
 all: xsvftool-ulink
 
