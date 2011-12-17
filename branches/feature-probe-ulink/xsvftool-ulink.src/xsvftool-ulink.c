@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <assert.h>
 #include <usb.h>
 
 #define DEFAULT_VENDOR_ID 0xC251
@@ -49,6 +50,13 @@ struct udata_s
 	uint8_t retbuf_expect_clr[16];
 	uint8_t retbuf_toretval[16];
 	int error, last_tdo;
+
+	uint8_t backlog_len;
+	uint8_t backlog_expect_set[16];
+	uint8_t backlog_expect_clr[16];
+	uint8_t backlog_toretval[16];
+
+	int last_tdi, last_tms, last_tck, last_trst;
 };
 
 int usb_send_chunk(usb_dev_handle *dh, int ep, const void *data, int len)
@@ -95,12 +103,114 @@ retry_read:
 	return ret == len ? 0 : -1;
 }
 
+static void xfer_response(struct udata_s *u, uint8_t *expect_set UNUSED, uint8_t *expect_clr UNUSED, uint8_t *toretval, uint8_t len)
+{
+	uint8_t response[len], i, j;
+	usb_recv_chunk(u->usbdev, 2, response, len, NULL);
+
+	for (i = 0; i < len; i++)
+	{
+		printf("> %2d: %02x %02x %02x\n", i, response[i], expect_set[i], expect_clr[i]);
+		if ((response[i] & expect_set[i]) != expect_set[i])
+			u->error = 1;
+		if ((~response[i] & expect_clr[i]) != expect_clr[i])
+			u->error = 1;
+		for (j = 0; toretval[i] && j < 8; j++)
+			if ((toretval[i] & (1 << j)) != 0)
+				u->retval[u->retval_i++] = (response[i] & (1 << j)) != 0;
+		u->last_tdo = (response[i] & 0x80) != 0;
+	}
+}
+
+static void queue(struct udata_s *u, int tdi, int tms, int tck, int trst, int sync);
+
+static void xfer(struct udata_s *u, int sync)
+{
+	while (u->cmdidx % 8 != 0)
+		queue(u, -1, -1, 1, -1, -1);
+	u->cmdbuf[0] = 0x06;
+	u->cmdbuf[1] = u->cmdidx / 8;
+
+	if (u->backlog_len) {
+		xfer_response(u, u->backlog_expect_set, u->backlog_expect_clr,
+				u->backlog_toretval, u->backlog_len);
+		u->backlog_len = 0;
+	}
+
+	// For probes with double buffering on EP2:
+	// Move this block before xfer_response backlog block above
+	// for improved speed. But without double buffering this would
+	// result in a deadlock. So we don't do it atm..
+	usb_send_chunk(u->usbdev, 2, u->cmdbuf, u->cmdbuf[1]*4 + 2);
+
+	u->last_tdo = -1;
+	if (sync) {
+		xfer_response(u, u->retbuf_expect_set, u->retbuf_expect_clr,
+				u->retbuf_toretval, u->cmdbuf[1]);
+	} else {
+		u->backlog_len = u->cmdbuf[1];
+		memcpy(u->backlog_expect_set, u->retbuf_expect_set, 16);
+		memcpy(u->backlog_expect_clr, u->retbuf_expect_clr, 16);
+		memcpy(u->backlog_toretval, u->retbuf_toretval, 16);
+	}
+
+	u->cmdidx = 0;
+}
+
+static void queue(struct udata_s *u, int tdi, int tms, int tck, int trst, int sync)
+{
+	if (u->cmdidx == 0) {
+		memset(u->cmdbuf, 0, 64);
+		memset(u->retbuf_expect_set, 0, 16);
+		memset(u->retbuf_expect_clr, 0, 16);
+		memset(u->retbuf_toretval, 0, 16);
+	}
+
+	if (tdi < 0)
+		tdi = u->last_tdi;
+	if (tms < 0)
+		tms = u->last_tms;
+	if (tck < 0)
+		tck = u->last_tck;
+	if (trst < 0)
+		trst = u->last_trst;
+
+	int command = 0;
+	if (tdi)
+		command |= 0x01;
+	if (tms)
+		command |= 0x02;
+	if (tck)
+		command |= 0x04;
+	if (trst)
+		command |= 0x08;
+
+	uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
+	if (u->cmdidx % 2 == 0)
+		u->cmdbuf[cmdoff] |= command;
+	else
+		u->cmdbuf[cmdoff] |= command << 4;
+
+	u->last_tdi = tdi;
+	u->last_tms = tms;
+	u->last_tck = tck;
+	u->last_trst = trst;
+
+	if (sync < 0)
+		return;
+
+	if (u->cmdidx >= 58*2 || sync)
+		xfer(u, sync);
+}
+
 static int h_setup(struct libxsvf_host *h)
 {
 	struct udata_s *u = h->user_data;
 
 	u->cmdidx = 0;
 	u->error = 0;
+	u->backlog_len = 0;
+	queue(u, 1, 1, 1, 1, 0);
 
 	if (u->verbose >= 2) {
 		fprintf(stderr, "[SETUP]\n");
@@ -148,10 +258,9 @@ static void h_udelay(struct libxsvf_host *h, long usecs, int tms, long num_tck)
 	if (num_tck > 0) {
 		struct timeval tv1, tv2;
 		gettimeofday(&tv1, NULL);
-		// FIXME: io_tms(tms);
+		queue(u, -1, tms, 1, -1, 0);
 		while (num_tck > 0) {
-			// FIXME: io_tck(0);
-			// FIXME: io_tck(1);
+			queue(u, -1, -1, 0, -1, 0);
 			num_tck--;
 		}
 		gettimeofday(&tv2, NULL);
@@ -176,36 +285,17 @@ static int h_getbyte(struct libxsvf_host *h)
 	return fgetc(u->f);
 }
 
-static void xfer(struct udata_s *u)
+static int h_sync(struct libxsvf_host *h)
 {
-	uint8_t response[16];
-	uint8_t i, j;
-
-	while (u->cmdidx % 8 != 0) {
-		uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
-		if (u->cmdidx % 2 == 0)
-			u->cmdbuf[cmdoff] |= 0x40;
-		else
-			u->cmdbuf[cmdoff] |= 0x04;
+	struct udata_s *u = h->user_data;
+	if (u->cmdidx == 0)
+		return 0;
+	xfer(u, 1);
+	if (u->error) {
+		u->error = 0;
+		return -1;
 	}
-
-	u->cmdbuf[1] = u->cmdidx / 8;
-	usb_send_chunk(u->usbdev, 2, u->cmdbuf, u->cmdbuf[1]*4 + 2);
-	usb_recv_chunk(u->usbdev, 2, response, u->cmdbuf[1], NULL);
-
-	for (i = 0; i < u->cmdbuf[1]; i++)
-	{
-		if ((response[i] & u->retbuf_expect_set[i]) != u->retbuf_expect_set[i])
-			u->error = 1;
-		if ((~response[i] & u->retbuf_expect_clr[i]) != u->retbuf_expect_clr[i])
-			u->error = 1;
-		for (j = 0; u->retbuf_toretval[i] && j < 8; j++)
-			if ((u->retbuf_toretval[i] & (1 << j)) != 0)
-				u->retval[u->retval_i++] = (response[i] & (1 << j)) != 0;
-		u->last_tdo = (response[i] & 0x80) != 0;
-	}
-
-	u->cmdidx = 0;
+	return 0;
 }
 
 static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rmask, int sync)
@@ -213,38 +303,21 @@ static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rm
 	struct udata_s *u = h->user_data;
 	int rc = 0;
 
-	if (u->cmdidx == 0) {
-		memset(u->cmdbuf, 0, 64);
-		memset(u->retbuf_expect_set, 0, 16);
-		memset(u->retbuf_expect_clr, 0, 16);
-		memset(u->retbuf_toretval, 0, 16);
-		u->cmdbuf[0] = 0x06;
-	}
-
-	uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
-
-	if (u->cmdidx % 2 == 0) {
-		u->cmdbuf[cmdoff] |= tdi ? 0x10 : 0x00;
-		u->cmdbuf[cmdoff] |= tms ? 0x20 : 0x00;
-	} else {
-		u->cmdbuf[cmdoff] |= tdi ? 0x01 : 0x00;
-		u->cmdbuf[cmdoff] |= tms ? 0x02 : 0x00;
-	}
+	int cmdidx = u->cmdidx;
+	queue(u, tdi, tms, 0, -1, -1);
 
 	if (tdo == 1)
-		u->retbuf_expect_set[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
+		u->retbuf_expect_set[cmdidx / 8] |= 1 << (cmdidx % 8);
 	if (tdo == 0)
-		u->retbuf_expect_clr[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
+		u->retbuf_expect_clr[cmdidx / 8] |= 1 << (cmdidx % 8);
 	if (rmask)
-		u->retbuf_toretval[u->cmdidx / 8] |= 1 << (u->cmdidx % 8);
+		u->retbuf_toretval[cmdidx / 8] |= 1 << (cmdidx % 8);
 
-	if (cmdoff > 60 || sync)
-		xfer(u);
-	else
-		u->last_tdo = -1;
+	if (u->cmdidx >= 58*2 || sync)
+		xfer(u, sync);
 
 	rc = tdo < 0 ? 1 : tdo;
-	if (sync) {
+	if (sync || (tdo >= 0 && u->error)) {
 		if (u->error) {
 			u->error = 0;
 			rc = -1;
@@ -259,23 +332,13 @@ static int h_pulse_tck(struct libxsvf_host *h, int tms, int tdi, int tdo, int rm
 	return rc;
 }
 
-#if 0
-static void h_pulse_sck(struct libxsvf_host *h)
-{
-	struct udata_s *u = h->user_data;
-	if (u->verbose >= 4) {
-		fprintf(stderr, "[SCK]\n");
-	}
-}
-#endif
-
 static void h_set_trst(struct libxsvf_host *h, int v)
 {
 	struct udata_s *u = h->user_data;
 	if (u->verbose >= 4) {
 		fprintf(stderr, "[TRST:%d]\n", v);
 	}
-	// FIXME: io_trst(v);
+	queue(u, -1, -1, -1, v, 0);
 }
 
 static int h_set_frequency(struct libxsvf_host *h UNUSED, int v)
@@ -328,8 +391,8 @@ static struct libxsvf_host h = {
 	.setup = h_setup,
 	.shutdown = h_shutdown,
 	.getbyte = h_getbyte,
+	.sync = h_sync,
 	.pulse_tck = h_pulse_tck,
-	// .pulse_sck = h_pulse_sck,
 	.set_trst = h_set_trst,
 	.set_frequency = h_set_frequency,
 	.report_tapstate = h_report_tapstate,
