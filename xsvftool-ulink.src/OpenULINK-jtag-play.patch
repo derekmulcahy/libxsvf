@@ -1,0 +1,197 @@
+Index: OpenULINK/include/msgtypes.h
+===================================================================
+--- OpenULINK/include/msgtypes.h	(revision 1933)
++++ OpenULINK/include/msgtypes.h	(working copy)
+@@ -152,6 +152,7 @@
+ #define CMD_SLOW_SCAN_OUT       0x03
+ #define CMD_SCAN_IO             0x04
+ #define CMD_SLOW_SCAN_IO        0x05
++#define CMD_PLAY                0x06
+ 
+ /* Commands with fixed payload size */
+ #define CMD_CLOCK_TMS           0x20
+Index: OpenULINK/include/jtag.h
+===================================================================
+--- OpenULINK/include/jtag.h	(revision 1933)
++++ OpenULINK/include/jtag.h	(working copy)
+@@ -34,6 +34,8 @@
+ void jtag_scan_io(uint8_t out_offset, uint8_t in_offset);
+ void jtag_slow_scan_io(uint8_t out_offset, uint8_t in_offset);
+ 
++void jtag_play(uint8_t out_offset, uint8_t in_offset);
++
+ void jtag_clock_tck(uint16_t count);
+ void jtag_slow_clock_tck(uint16_t count);
+ void jtag_clock_tms(uint8_t count, uint8_t sequence);
+Index: OpenULINK/src/protocol.c
+===================================================================
+--- OpenULINK/src/protocol.c	(revision 1933)
++++ OpenULINK/src/protocol.c	(working copy)
+@@ -135,6 +135,11 @@
+     usb_out_bytecount = usb_in_bytecount + 5;
+     jtag_slow_scan_io(cmd_id_index + 1, payload_index_in);
+     break;
++  case CMD_PLAY:
++    usb_in_bytecount = OUT2BUF[cmd_id_index + 1];
++    usb_out_bytecount = usb_in_bytecount << 2 + 2;
++    jtag_play(cmd_id_index + 1, payload_index_in);
++    break;
+   case CMD_SLOW_CLOCK_TMS:
+     usb_out_bytecount = 2;
+     jtag_slow_clock_tms(OUT2BUF[cmd_id_index + 1], OUT2BUF[cmd_id_index + 2]);
+Index: OpenULINK/src/jtag.c
+===================================================================
+--- OpenULINK/src/jtag.c	(revision 1933)
++++ OpenULINK/src/jtag.c	(working copy)
+@@ -584,6 +584,96 @@
+ }
+ 
+ /**
++ * Play set of JTAG transactions (one transaction per nibble)
++ *
++ * Data stored in EP2 OUT buffer is shifted into the JTAG chain via TDI, TMS,
++ * TCK and TRST. TDO data is sampled and stored in the EP2 IN buffer.
++ *
++ * Average TCK frequency is 100 kHz for ULINK clocked at 24 MHz.
++ *
++ * @param out_offset offset in OUT2BUF where payload data starts
++ */
++void jtag_play(uint8_t out_offset, uint8_t in_offset)
++{
++  uint8_t outb_buffer = OUTB & 0xf0;
++  uint8_t blocks = OUT2BUF[out_offset++];
++  uint8_t i, nextcmd = OUT2BUF[out_offset] & 0x0f;
++  for (i = 0; i < blocks; i++)
++  {
++    uint8_t tdo_buf = 0;
++
++// #define JTAG_PLAY_EXTRADELAY() do { } while (0)
++#define JTAG_PLAY_EXTRADELAY() do { uint16_t _count; for (_count = 0; _count < 1000; _count++) { _asm nop; _endasm; } } while (0)
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset++] >> 4;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x01 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset] & 0x0f;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x02 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset++] >> 4;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x04 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset] & 0x0f;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x08 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset++] >> 4;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x10 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset] & 0x0f;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x20 : 0;
++
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset++] >> 4;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x40 : 0;
++
++    // Note: in this step we might read the first byte in OUT2BUF[]
++    // after the payload for this play command. Afaics this should
++    // not be a problem as play pkts are max 62 bytes long and the
++    // buffer is 64 bytes in size. But it might be a bad idea to
++    // send a play command with the payload align to the end of
++    // the endpoint buffer..
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = outb_buffer | nextcmd;
++    nextcmd = OUT2BUF[out_offset] & 0x0f;
++    JTAG_PLAY_EXTRADELAY();
++    OUTB = OUTB | PIN_TCK;
++    tdo_buf |= GET_TDO() ? 0x80 : 0;
++
++#undef JTAG_PLAY_EXTRADELAY
++
++    IN2BUF[in_offset++] = tdo_buf;
++  }
++}
++
++/**
+  * Generate TCK clock cycles.
+  *
+  * Maximum achievable TCK frequency is 375 kHz for ULINK clocked at 24 MHz.
+Index: OpenULINK/src/USBJmpTb.a51
+===================================================================
+--- OpenULINK/src/USBJmpTb.a51	(revision 1933)
++++ OpenULINK/src/USBJmpTb.a51	(working copy)
+@@ -28,7 +28,7 @@
+ .area   USB_JV (ABS,OVR)   ; Absolute, Overlay
+ .org    0x43               ; USB interrupt (INT2) jumps here
+ USB_AutoVector = #. + 2
+-    ljmp  USB_jump_table
++    ljmp  USB_Jump_Table
+ 
+ ;--------------------------------------------------------------------------;
+ ; USB Jump Table                                                           ;
+@@ -36,7 +36,7 @@
+ .area  USB_JT (ABS)        ; Absolute placement
+ .org   0x1B00              ; Place jump table at 0x1B00
+ 
+-USB_jump_table:            ; autovector jump table
++USB_Jump_Table:            ; autovector jump table
+     ljmp  _sudav_isr       ; Setup Data Available
+     .db 0
+     ljmp  _sof_isr         ; Start of Frame
+Index: OpenULINK/Makefile
+===================================================================
+--- OpenULINK/Makefile	(revision 1933)
++++ OpenULINK/Makefile	(working copy)
+@@ -23,15 +23,15 @@
+ PREFIX =
+ 
+ # Small Device C Compiler: http://sdcc.sourceforge.net/
+-CC = $(PREFIX)-sdcc
++CC = $(PREFIX)sdcc
+ 
+ # 8051 assembler, part of the SDCC software package.
+-AS = $(PREFIX)-sdas8051
++AS = $(PREFIX)asx8051
+ 
+ # SDCC produces quite messy Intel HEX files. This tool is be used to re-format
+ # those files. It is not required for the firmware download functionality in
+ # the OpenOCD driver, but the resulting file is smaller.
+-PACKIHX = $(PREFIX)-packihx
++PACKIHX = $(PREFIX)packihx
+ 
+ # GNU binutils size. Used to print the size of the IHX file generated by SDCC.
+ SIZE = size
+@@ -80,7 +80,8 @@
+ 	$(CC) -c $(CFLAGS) -mmcs51 -I$(INCLUDE_DIR) -o $@ $<
+ 
+ %.rel: $(SRC_DIR)/%.a51
+-	$(AS) -lsgo $@ $<
++	cp $< $(notdir $<)
++	$(AS) -lsgo $(notdir $<)
+ 
+ clean:
+ 	rm -f *.asm *.lst *.rel *.rst *.sym *.ihx *.lnk *.map *.mem

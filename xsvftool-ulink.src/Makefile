@@ -19,7 +19,7 @@
 LIBXSVFDIR = ..
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -Os -ggdb -I$(LIBXSVFDIR) -MD
+CFLAGS = -Wall -Wextra -Os -ggdb -I$(LIBXSVFDIR) -MD
 LDFLAGS = -L$(LIBXSVFDIR)
 LDLIBS = -lusb -lreadline -lxsvf
 
