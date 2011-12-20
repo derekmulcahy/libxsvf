@@ -65,8 +65,8 @@ Index: OpenULINK/src/jtag.c
 +  {
 +    uint8_t tdo_buf = 0;
 +
-+// #define JTAG_PLAY_EXTRADELAY() do { } while (0)
-+#define JTAG_PLAY_EXTRADELAY() do { uint16_t _count; for (_count = 0; _count < 1000; _count++) { _asm nop; _endasm; } } while (0)
++#define JTAG_PLAY_EXTRADELAY() do { } while (0)
++// #define JTAG_PLAY_EXTRADELAY() do { uint16_t _count; for (_count = 0; _count < 1000; _count++) { _asm nop; _endasm; } } while (0)
 +
 +    JTAG_PLAY_EXTRADELAY();
 +    OUTB = outb_buffer | nextcmd;

@@ -110,11 +110,11 @@ static void xfer_response(struct udata_s *u, uint8_t *expect_set UNUSED, uint8_t
 
 	for (i = 0; i < len; i++)
 	{
-		printf("> %2d: %02x %02x %02x\n", i, response[i], expect_set[i], expect_clr[i]);
 		if ((response[i] & expect_set[i]) != expect_set[i])
 			u->error = 1;
 		if ((~response[i] & expect_clr[i]) != expect_clr[i])
 			u->error = 1;
+		// printf("> %2d: %02x %02x %02x%s\n", i, response[i], expect_set[i], expect_clr[i], u->error ? " *" : "");
 		for (j = 0; toretval[i] && j < 8; j++)
 			if ((toretval[i] & (1 << j)) != 0)
 				u->retval[u->retval_i++] = (response[i] & (1 << j)) != 0;
@@ -187,9 +187,9 @@ static void queue(struct udata_s *u, int tdi, int tms, int tck, int trst, int sy
 
 	uint8_t cmdoff = (u->cmdidx++ >> 1) + 2;
 	if (u->cmdidx % 2 == 0)
-		u->cmdbuf[cmdoff] |= command;
-	else
 		u->cmdbuf[cmdoff] |= command << 4;
+	else
+		u->cmdbuf[cmdoff] |= command;
 
 	u->last_tdi = tdi;
 	u->last_tms = tms;
