@@ -51,10 +51,15 @@ struct udata_s
 	uint8_t retbuf_toretval[16];
 	int error, last_tdo;
 
-	uint8_t backlog_len;
-	uint8_t backlog_expect_set[16];
-	uint8_t backlog_expect_clr[16];
-	uint8_t backlog_toretval[16];
+	uint8_t backlog1_len;
+	uint8_t backlog1_expect_set[16];
+	uint8_t backlog1_expect_clr[16];
+	uint8_t backlog1_toretval[16];
+
+	uint8_t backlog2_len;
+	uint8_t backlog2_expect_set[16];
+	uint8_t backlog2_expect_clr[16];
+	uint8_t backlog2_toretval[16];
 
 	int last_tdi, last_tms, last_tck, last_trst;
 };
@@ -131,27 +136,34 @@ static void xfer(struct udata_s *u, int sync)
 	u->cmdbuf[0] = 0x06;
 	u->cmdbuf[1] = u->cmdidx / 8;
 
-	if (u->backlog_len) {
-		xfer_response(u, u->backlog_expect_set, u->backlog_expect_clr,
-				u->backlog_toretval, u->backlog_len);
-		u->backlog_len = 0;
+	usb_send_chunk(u->usbdev, 2, u->cmdbuf, u->cmdbuf[1]*4 + 2);
+
+	if (u->backlog2_len) {
+		xfer_response(u, u->backlog2_expect_set, u->backlog2_expect_clr,
+				u->backlog2_toretval, u->backlog2_len);
+		u->backlog2_len = 0;
 	}
 
-	// For probes with double buffering on EP2:
-	// Move this block before xfer_response backlog block above
-	// for improved speed. But without double buffering this would
-	// result in a deadlock. So we don't do it atm..
-	usb_send_chunk(u->usbdev, 2, u->cmdbuf, u->cmdbuf[1]*4 + 2);
+	if (sync && u->backlog1_len) {
+		xfer_response(u, u->backlog1_expect_set, u->backlog1_expect_clr,
+				u->backlog1_toretval, u->backlog1_len);
+		u->backlog1_len = 0;
+	}
 
 	u->last_tdo = -1;
 	if (sync) {
 		xfer_response(u, u->retbuf_expect_set, u->retbuf_expect_clr,
 				u->retbuf_toretval, u->cmdbuf[1]);
 	} else {
-		u->backlog_len = u->cmdbuf[1];
-		memcpy(u->backlog_expect_set, u->retbuf_expect_set, 16);
-		memcpy(u->backlog_expect_clr, u->retbuf_expect_clr, 16);
-		memcpy(u->backlog_toretval, u->retbuf_toretval, 16);
+		u->backlog2_len = u->backlog1_len;
+		memcpy(u->backlog2_expect_set, u->backlog1_expect_set, 16);
+		memcpy(u->backlog2_expect_clr, u->backlog1_expect_clr, 16);
+		memcpy(u->backlog2_toretval,   u->backlog1_toretval,   16);
+
+		u->backlog1_len = u->cmdbuf[1];
+		memcpy(u->backlog1_expect_set, u->retbuf_expect_set, 16);
+		memcpy(u->backlog1_expect_clr, u->retbuf_expect_clr, 16);
+		memcpy(u->backlog1_toretval,   u->retbuf_toretval,   16);
 	}
 
 	u->cmdidx = 0;
@@ -209,7 +221,8 @@ static int h_setup(struct libxsvf_host *h)
 
 	u->cmdidx = 0;
 	u->error = 0;
-	u->backlog_len = 0;
+	u->backlog1_len = 0;
+	u->backlog2_len = 0;
 	queue(u, 1, 1, 1, 1, 0);
 
 	if (u->verbose >= 2) {
