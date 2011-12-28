@@ -92,10 +92,10 @@ index 6f774dd..03d76d9 100644
      .db 0
      ljmp  _sof_isr         ; Start of Frame
 diff --git a/src/drivers/OpenULINK/src/jtag.c b/src/drivers/OpenULINK/src/jtag.c
-index 3c2fea2..c8350b3 100644
+index 3c2fea2..ca4e8af 100644
 --- a/src/drivers/OpenULINK/src/jtag.c
 +++ b/src/drivers/OpenULINK/src/jtag.c
-@@ -584,6 +584,288 @@ void jtag_slow_scan_io(uint8_t out_offset, uint8_t in_offset)
+@@ -584,6 +584,259 @@ void jtag_slow_scan_io(uint8_t out_offset, uint8_t in_offset)
  }
  
  /**
@@ -104,7 +104,7 @@ index 3c2fea2..c8350b3 100644
 + * Data stored in EP2 OUT buffer is shifted into the JTAG chain via TDI, TMS,
 + * TCK and TRST. TDO data is sampled and stored in the EP2 IN buffer.
 + *
-+ * Maximum achievable TCK frequency is 160 kHz for ULINK clocked at 24 MHz.
++ * Maximum achievable TCK frequency is 200 kHz for ULINK clocked at 24 MHz.
 + *
 + * @param out_offset offset in OUT2BUF where payload data starts
 + */
@@ -120,14 +120,23 @@ index 3c2fea2..c8350b3 100644
 +	mov	r2,	dpl
 +	mov	r3,	_jtag_play_PARM_2
 +
-+	; r4 <- num of blocks to process + in_offset
-+	; _OUT2BUF is aligned in a way that we will not
-+	; overflow in this simple address calculation
-+	mov	a,	#(_OUT2BUF >> 8)
-+	mov	dph,	a
++	; add low part of #_OUT2BUF directly to r2
++	; this way we don't need an additional add for
++	; each access to OUT2BUF
 +	mov	a,	r2
 +	add	a,	#_OUT2BUF
-+	mov	dpl,	a
++	mov	r2,	a
++
++	; add low part of #_IN2BUF directly to r3
++	mov	a,	r3
++	add	a,	#_IN2BUF
++	mov	r3,	a
++
++	; r4 <- num of blocks to process + r3
++	; _OUT2BUF is aligned in a way that we will not
++	; overflow in this kind of address calculations
++	mov	dph,	#(_OUT2BUF >> 8)
++	mov	dpl,	r2
 +	movx	a,	@dptr
 +	add	a,	r3
 +	mov	r4,	a
@@ -148,16 +157,11 @@ index 3c2fea2..c8350b3 100644
 +	ret
 +jtag_play_loop_body:
 +
-+	; initialize result byte
-+	mov 	r7,	#0
-+
 +	; ================== TRANSFER 1/8 ==================
 +
 +	; load command to r6
 +	mov	dph,	#(_OUT2BUF >> 8)
-+	mov	a,	r2
-+	add	a,	#_OUT2BUF
-+	mov	dpl,	a
++	mov	dpl,	r2
 +	movx	a,	@dptr
 +	mov	r6,	a
 +	inc	r2
@@ -172,14 +176,11 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x01
-+	mov	a,	r7
-+	orl	a,	#0x01
-+	mov	r7,	a
-+jtag_play_tdo_0x01:
++	mov	c,	acc.5
++	mov	b.0,	c
 +
 +	; ================== TRANSFER 2/8 ==================
 +
@@ -195,22 +196,17 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x02
-+	mov	a,	r7
-+	orl	a,	#0x02
-+	mov	r7,	a
-+jtag_play_tdo_0x02:
++	mov	c,	acc.5
++	mov	b.1,	c
 +
 +	; ================== TRANSFER 3/8 ==================
 +
 +	; load command to r6
 +	mov	dph,	#(_OUT2BUF >> 8)
-+	mov	a,	r2
-+	add	a,	#_OUT2BUF
-+	mov	dpl,	a
++	mov	dpl,	r2
 +	movx	a,	@dptr
 +	mov	r6,	a
 +	inc	r2
@@ -225,14 +221,11 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x04
-+	mov	a,	r7
-+	orl	a,	#0x04
-+	mov	r7,	a
-+jtag_play_tdo_0x04:
++	mov	c,	acc.5
++	mov	b.2,	c
 +
 +	; ================== TRANSFER 4/8 ==================
 +
@@ -248,22 +241,17 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x08
-+	mov	a,	r7
-+	orl	a,	#0x08
-+	mov	r7,	a
-+jtag_play_tdo_0x08:
++	mov	c,	acc.5
++	mov	b.3,	c
 +
 +	; ================== TRANSFER 5/8 ==================
 +
 +	; load command to r6
 +	mov	dph,	#(_OUT2BUF >> 8)
-+	mov	a,	r2
-+	add	a,	#_OUT2BUF
-+	mov	dpl,	a
++	mov	dpl,	r2
 +	movx	a,	@dptr
 +	mov	r6,	a
 +	inc	r2
@@ -278,14 +266,11 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x10
-+	mov	a,	r7
-+	orl	a,	#0x10
-+	mov	r7,	a
-+jtag_play_tdo_0x10:
++	mov	c,	acc.5
++	mov	b.4,	c
 +
 +	; ================== TRANSFER 6/8 ==================
 +
@@ -301,22 +286,17 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x20
-+	mov	a,	r7
-+	orl	a,	#0x20
-+	mov	r7,	a
-+jtag_play_tdo_0x20:
++	mov	c,	acc.5
++	mov	b.5,	c
 +
 +	; ================== TRANSFER 7/8 ==================
 +
 +	; load command to r6
 +	mov	dph,	#(_OUT2BUF >> 8)
-+	mov	a,	r2
-+	add	a,	#_OUT2BUF
-+	mov	dpl,	a
++	mov	dpl,	r2
 +	movx	a,	@dptr
 +	mov	r6,	a
 +	inc	r2
@@ -331,14 +311,11 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x40
-+	mov	a,	r7
-+	orl	a,	#0x40
-+	mov	r7,	a
-+jtag_play_tdo_0x40:
++	mov	c,	acc.5
++	mov	b.6,	c
 +
 +	; ================== TRANSFER 8/8 ==================
 +
@@ -354,24 +331,18 @@ index 3c2fea2..c8350b3 100644
 +	orl	a,	#0x04
 +	movx	@dptr,	a
 +
-+	; checking tdo
++	; checking tdo (write to b reg)
 +	mov	dptr,	#_PINSA
 +	movx	a,	@dptr
-+	jnb	acc.5,	jtag_play_tdo_0x80
-+	mov	a,	r7
-+	orl	a,	#0x80
-+	mov	r7,	a
-+jtag_play_tdo_0x80:
++	mov	c,	acc.5
++	mov	b.7,	c
 +
 +	; ================== END TRANSFER ==================
 +
 +	; store result byte
-+	mov	a,	#(_IN2BUF >> 8)
-+	mov	dph,	a
-+	mov	a,	r3
-+	add	a,	#_IN2BUF
-+	mov	dpl,	a
-+	mov	a,	r7
++	mov	dph,	#(_IN2BUF >> 8)
++	mov	dpl,	r3
++	mov	a,	b
 +	movx	@dptr,	a
 +	inc	r3
 +
